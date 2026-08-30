@@ -792,14 +792,30 @@
      * 8. WEBPACK MODULE RESOLVER
      * =========================================================================
      * Resiliently extracts Discord Flux Stores, Dispatcher, and Rest API.
+     * Uses displayName and prototype inspection, filtering out Sentry runtimes.
      */
     let Mods = {};
 
     function loadModules() {
         try {
-            // Check for Vencord Webpack API first
+            // === 1. Vencord Webpack API (if running under Vencord) ===
             if (typeof window.Vencord !== 'undefined' && window.Vencord.Webpack) {
+                Logger.log('[System] Vencord detected. Using Vencord Webpack API...', 'info');
                 const W = window.Vencord.Webpack;
+
+                let routerModule;
+                try {
+                    const m = W.findByCode('transitionTo -');
+                    if (m) {
+                        for (const prop of [m, m.default, ...Object.values(m)]) {
+                            if (typeof prop === 'function' && prop.toString().includes('transitionTo -')) {
+                                routerModule = { transitionTo: prop };
+                                break;
+                            }
+                        }
+                    }
+                } catch (_) {}
+
                 Mods = {
                     QuestStore: W.findStore('QuestStore') || W.findStore('QuestsStore'),
                     RunStore: W.findStore('RunningGameStore'),
@@ -807,48 +823,133 @@
                     ChanStore: W.findStore('ChannelStore'),
                     GuildChanStore: W.findStore('GuildChannelStore'),
                     UserStore: W.findStore('UserStore'),
-                    Dispatcher: W.Common?.FluxDispatcher || W.findByProps('dispatch', 'subscribe'),
-                    API: W.Common?.RestAPI || W.findByProps('get', 'post', 'del')
+                    Dispatcher: W.Common?.FluxDispatcher || W.findByProps('dispatch', 'subscribe', 'flushWaitQueue'),
+                    API: W.Common?.RestAPI || W.findByProps('get', 'post', 'del'),
+                    Router: routerModule
                 };
-                if (Mods.QuestStore && Mods.API && Mods.Dispatcher && Mods.RunStore) {
+
+                const required = ['QuestStore', 'API', 'Dispatcher', 'RunStore'];
+                const missing = required.filter(k => !Mods[k]);
+                if (missing.length === 0) {
                     Patcher.init(Mods.RunStore);
                     return true;
                 }
+                Logger.log(`[System] Vencord extraction missed: ${missing.join(', ')}. Falling back to native...`, 'warn');
             }
 
-            // Native Webpack fallback
+            // === 2. Native Webpack Runtime Extraction (Standard Discord / Web / PTB / Canary) ===
             if (typeof webpackChunkdiscord_app === 'undefined') {
-                throw new Error("Webpack chunk not found.");
+                throw new Error("Webpack chunk not found - is this running inside Discord?");
             }
 
+            // Pick runtime with the largest cache to avoid Sentry's stripped mini-runtime
             let req;
-            webpackChunkdiscord_app.push([[Symbol()], {}, r => { req = r; }]);
+            webpackChunkdiscord_app.push([[Symbol()], {}, r => {
+                const cur = Object.keys(req?.c || {}).length;
+                const incoming = Object.keys(r?.c || {}).length;
+                if (incoming > cur) req = r;
+            }]);
             webpackChunkdiscord_app.pop();
 
-            if (!req?.c) throw new Error("Webpack module cache unavailable.");
+            if (!req?.c) throw new Error("Module registry not available.");
             const modules = Object.values(req.c);
 
-            const findStore = name => modules.find(m => m?.exports?.A?.__proto__?.constructor?.displayName === name || m?.exports?.Ay?.constructor?.displayName === name)?.exports?.A || modules.find(m => m?.exports?.default?.constructor?.displayName === name)?.exports?.default;
-            
+            // Store locator: checks constructor displayName
+            function findStore(storeName) {
+                for (const m of modules) {
+                    try {
+                        const exp = m?.exports;
+                        if (!exp || typeof exp !== 'object') continue;
+                        for (const key of Object.keys(exp)) {
+                            const prop = exp[key];
+                            if (prop && typeof prop === 'object'
+                                && prop.__proto__?.constructor?.displayName === storeName) {
+                                return prop;
+                            }
+                        }
+                    } catch (_) {}
+                }
+                return undefined;
+            }
+
+            // FluxDispatcher locator
+            function findDispatcher() {
+                for (const m of modules) {
+                    try {
+                        const exp = m?.exports;
+                        if (!exp || typeof exp !== 'object') continue;
+                        for (const key of Object.keys(exp)) {
+                            const prop = exp[key];
+                            if (prop && prop._subscriptions
+                                && typeof prop.subscribe === 'function'
+                                && typeof prop.dispatch === 'function'
+                                && typeof prop.__proto__?.flushWaitQueue === 'function') {
+                                return prop;
+                            }
+                        }
+                    } catch (_) {}
+                }
+                return undefined;
+            }
+
+            // Rest API locator
+            function findAPI() {
+                for (const m of modules) {
+                    try {
+                        const exp = m?.exports;
+                        if (!exp || typeof exp !== 'object') continue;
+                        for (const key of Object.keys(exp)) {
+                            const prop = exp[key];
+                            if (prop && typeof prop.get === 'function'
+                                && typeof prop.post === 'function'
+                                && typeof prop.del === 'function'
+                                && !prop._dispatcher) {
+                                return prop;
+                            }
+                        }
+                    } catch (_) {}
+                }
+                return undefined;
+            }
+
+            // Router transition locator
+            function findRouter() {
+                for (const m of modules) {
+                    try {
+                        const exp = m?.exports;
+                        if (!exp) continue;
+                        for (const prop of [exp, exp.default, ...Object.values(exp)]) {
+                            if (typeof prop === 'function' && prop.toString().includes('transitionTo -')) {
+                                return { transitionTo: prop };
+                            }
+                        }
+                    } catch (_) {}
+                }
+                return undefined;
+            }
+
             Mods = {
-                QuestStore: modules.find(x => x?.exports?.A?.__proto__?.getQuest)?.exports?.A || findStore('QuestStore'),
-                RunStore: modules.find(x => x?.exports?.Ay?.getRunningGames)?.exports?.Ay || findStore('RunningGameStore'),
-                StreamStore: modules.find(x => x?.exports?.A?.__proto__?.getStreamerActiveStreamMetadata)?.exports?.A || findStore('ApplicationStreamingStore'),
-                ChanStore: modules.find(x => x?.exports?.A?.__proto__?.getAllThreadsForParent)?.exports?.A || findStore('ChannelStore'),
-                GuildChanStore: modules.find(x => x?.exports?.Ay?.getSFWDefaultChannel)?.exports?.Ay || findStore('GuildChannelStore'),
-                UserStore: findStore('UserStore') || modules.find(x => x?.exports?.default?.getCurrentUser)?.exports?.default,
-                Dispatcher: modules.find(x => x?.exports?.h?.__proto__?.flushWaitQueue)?.exports?.h || modules.find(x => x?.exports?.default?.dispatch && x?.exports?.default?.subscribe)?.exports?.default,
-                API: modules.find(x => x?.exports?.Bo?.get)?.exports?.Bo || modules.find(x => x?.exports?.default?.get && x?.exports?.default?.post)?.exports?.default
+                QuestStore: findStore('QuestStore') || findStore('QuestsStore'),
+                RunStore: findStore('RunningGameStore'),
+                StreamStore: findStore('ApplicationStreamingStore'),
+                ChanStore: findStore('ChannelStore'),
+                GuildChanStore: findStore('GuildChannelStore'),
+                UserStore: findStore('UserStore'),
+                Dispatcher: findDispatcher(),
+                API: findAPI(),
+                Router: findRouter()
             };
 
-            if (!Mods.QuestStore || !Mods.API || !Mods.Dispatcher || !Mods.RunStore) {
-                throw new Error("Essential Discord modules could not be resolved.");
+            const required = ['QuestStore', 'API', 'Dispatcher', 'RunStore'];
+            const missing = required.filter(k => !Mods[k]);
+            if (missing.length > 0) {
+                throw new Error(`Core modules not found: ${missing.join(', ')}`);
             }
 
             Patcher.init(Mods.RunStore);
             return true;
         } catch (e) {
-            Logger.log(`[Loader] Module init failed: ${e.message}`, 'err');
+            Logger.log(`[Loader] Module init failed: ${e.message ?? e}`, 'err');
             return false;
         }
     }
